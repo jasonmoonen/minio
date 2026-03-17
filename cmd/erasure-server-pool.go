@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net/http"
 	"path"
@@ -415,6 +416,10 @@ func (z *erasureServerPools) getAvailablePoolIdx(ctx context.Context, bucket, ob
 // Negative sizes are seen as 0 bytes.
 func (z *erasureServerPools) getServerPoolsAvailableSpace(ctx context.Context, bucket, object string, size int64) serverPoolsAvailableSpace {
 	serverPools := make(serverPoolsAvailableSpace, len(z.serverPools))
+	scParity := globalStorageClass.GetParityForSC(storageclass.STANDARD)
+	if scParity < 0 {
+		scParity = z.serverPools[0].defaultParityCount
+	}
 
 	storageInfos := make([][]*DiskInfo, len(z.serverPools))
 	nSets := make([]int, len(z.serverPools))
@@ -443,32 +448,39 @@ func (z *erasureServerPools) getServerPoolsAvailableSpace(ctx context.Context, b
 			serverPools[i] = poolAvailableSpace{Index: i}
 			continue
 		}
-		var available uint64
 		if !isMinioMetaBucketName(bucket) {
 			if avail, err := hasSpaceFor(zinfo, size); err != nil || !avail {
 				serverPools[i] = poolAvailableSpace{Index: i}
 				continue
 			}
 		}
+
+		dataDrives := z.serverPools[i].SetDriveCount() - scParity
+		if dataDrives <= 0 {
+			serverPools[i] = poolAvailableSpace{Index: i}
+			continue
+		}
+
 		var maxUsedPct int
+		minDiskFree := uint64(math.MaxUint64)
 		for _, disk := range zinfo {
 			if disk == nil || disk.Total == 0 {
 				continue
 			}
-			available += disk.Total - disk.Used
-
-			// set maxUsedPct to the value from the disk with the least space percentage.
+			if free := disk.Total - disk.Used; free < minDiskFree {
+				minDiskFree = free
+			}
 			if pctUsed := int(disk.Used * 100 / disk.Total); pctUsed > maxUsedPct {
 				maxUsedPct = pctUsed
 			}
 		}
+		if minDiskFree == math.MaxUint64 {
+			serverPools[i] = poolAvailableSpace{Index: i}
+			continue
+		}
 
-		// Since we are comparing pools that may have a different number of sets
-		// we multiply by the number of sets in the pool.
-		// This will compensate for differences in set sizes
-		// when choosing destination pool.
-		// Different set sizes are already compensated by less disks.
-		available *= uint64(nSets[i])
+		// Usable free: smallest disk's free space * data drives * sets in pool.
+		available := minDiskFree * uint64(dataDrives) * uint64(nSets[i])
 
 		serverPools[i] = poolAvailableSpace{
 			Index:      i,
